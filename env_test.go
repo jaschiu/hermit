@@ -259,6 +259,8 @@ func TestEnsureInstalledChecksChannelFreshness(t *testing.T) {
 	stale := time.Now().Add(-2 * time.Hour)
 	etagFile := filepath.Join(fixture.State.Root(), "metadata", "test@chan.etag")
 	assert.NoError(t, os.Chtimes(etagFile, stale, stale))
+	checkedFile := filepath.Join(fixture.State.Root(), "metadata", "test@chan.checked")
+	assert.NoError(t, os.WriteFile(checkedFile, []byte(stale.Format(time.RFC3339Nano)), 0600))
 	etag = "changed"
 	data = "newdata"
 
