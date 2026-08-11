@@ -57,6 +57,7 @@ func NewGitSourceWithLockTimeout(uri redact.URL, sourceDir string, runner util.C
 	return &GitSource{
 		fs: &uriFS{
 			uri: uri.String(),
+			dir: path,
 			FS:  os.DirFS(path),
 		},
 		remote:      uri,
