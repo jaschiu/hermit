@@ -12,6 +12,7 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
+	"github.com/cashapp/hermit/redact"
 	"github.com/cashapp/hermit/sources"
 	"github.com/cashapp/hermit/ui"
 	"github.com/cashapp/hermit/util"
@@ -35,7 +36,16 @@ func newSlowCloningGit(cloneDelay time.Duration, cloneLog string) *slowCloningGi
 	return &slowCloningGit{cloneDelay: cloneDelay, cloneLog: cloneLog}
 }
 
-func (g *slowCloningGit) RunInDir(_ *ui.Task, dir string, args ...string) error {
+func (g *slowCloningGit) CaptureInDir(_ ui.Logger, _ string, args ...redact.Value) ([]byte, error) {
+	return nil, fmt.Errorf("unexpected command: %v", redact.Reveal(args))
+}
+
+func (g *slowCloningGit) RunInDir(_ *ui.Task, dir string, values ...redact.Value) error {
+	args := redact.Reveal(values)
+	// Skip the "-c key=value" options util.GitArgs prepends.
+	for len(args) >= 3 && args[0] == "git" && args[1] == "-c" {
+		args = append([]string{"git"}, args[3:]...)
+	}
 	if len(args) < 2 || args[0] != "git" {
 		return fmt.Errorf("unexpected command: %v", args)
 	}
@@ -188,7 +198,7 @@ func TestConcurrentSyncInProcess(t *testing.T) {
 			ready.Done()
 			<-start
 			u, _ := ui.NewForTesting()
-			source := sources.NewGitSource(uri, sourceDir, runner)
+			source := sources.NewGitSource(redact.URL(uri), sourceDir, runner)
 			_, err := source.Sync(u, true)
 			assert.NoError(t, err)
 		}()
@@ -301,9 +311,63 @@ func TestSyncChildProcess(t *testing.T) {
 	}
 
 	runner := newSlowCloningGit(delay, cloneLog)
-	source := sources.NewGitSource(uri, sourceDir, runner)
+	source := sources.NewGitSource(redact.URL(uri), sourceDir, runner)
 	u, _ := ui.NewForTesting()
 	if _, err := source.Sync(u, true); err != nil {
 		t.Fatalf("sync failed: %s", err)
 	}
+}
+
+// TestSyncLockTimeoutFallsBackToExistingCopy verifies that, when a source
+// already has a usable copy on disk but the sync lock can't be acquired
+// within the configured timeout, Sync degrades to using the existing copy
+// rather than failing outright. Lock contention is exercised with a genuine
+// separate process (TestHoldSourceLockChildProcess), for the same
+// per-PID-reentrancy reason as the cross-process clone test above.
+func TestSyncLockTimeoutFallsBackToExistingCopy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a subprocess; skipped in -short")
+	}
+	sourceDir := t.TempDir()
+	uri := "git://lock-timeout-test"
+	runner := newSlowCloningGit(0, filepath.Join(t.TempDir(), "clones.log"))
+	source := sources.NewGitSource(redact.URL(uri), sourceDir, runner)
+
+	// Populate an initial copy so Sync has an existing tree to fall back to.
+	u, _ := ui.NewForTesting()
+	_, err := source.Sync(u, true)
+	assert.NoError(t, err)
+
+	path := filepath.Join(sourceDir, util.Hash(uri))
+	readyFile := filepath.Join(t.TempDir(), "lock-held")
+	holdFor := 500 * time.Millisecond
+	cmd := exec.Command(os.Args[0], "-test.run=TestHoldSourceLockChildProcess", "-test.v")
+	cmd.Env = append(os.Environ(),
+		"HERMIT_TEST_CHILD=1",
+		"HERMIT_TEST_LOCK_PATH="+path,
+		"HERMIT_TEST_LOCK_HOLD="+holdFor.String(),
+		"HERMIT_TEST_LOCK_READY_FILE="+readyFile,
+	)
+	assert.NoError(t, cmd.Start())
+	// Guarantee the child is reaped even if an assertion below fails the
+	// test early (assert.* calls t.Fatalf, which skips the cmd.Wait() at
+	// the end of this function): an orphaned child would otherwise keep
+	// holding the lock file open for the rest of holdFor.
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	// Wait for the child to actually confirm it holds the lock, rather than
+	// guessing how long that takes: a fixed sleep here would be flaky on a
+	// slow/loaded machine (racing shortTimeoutSource.Sync below before the
+	// child has the lock at all) and wastes time everywhere else.
+	waitForFile(t, readyFile, 30*time.Second)
+
+	shortTimeoutSource := sources.NewGitSourceWithLockTimeout(redact.URL(uri), sourceDir, runner, 10*time.Millisecond)
+	did, err := shortTimeoutSource.Sync(u, true)
+	assert.NoError(t, err)
+	assert.False(t, did, "should have skipped syncing and fallen back to the existing copy")
+
+	assert.NoError(t, cmd.Wait())
 }
